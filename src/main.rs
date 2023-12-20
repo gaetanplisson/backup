@@ -1,26 +1,26 @@
-use std::fs::File;
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use futures::future::ErrInto;
-use opendal::raw::oio::Stream;
-use tar::Builder;
+use async_compression::futures::write::GzipEncoder;
+use futures::Stream;
 use opendal::services::Webdav;
 use opendal::{Operator, Entry};
 use opendal::raw::HttpClient;
-use tokio;
 use reqwest;
+use async_tar::Builder;
+use async_fs::File;
 use futures::stream::StreamExt;
-use tokio::io::AsyncReadExt;
+use tokio;
+use tokio::task;
+use tokio::task::JoinHandle;
+use futures::future::{join_all, Join};
+use rayon::prelude::*;
+use std::sync::{Arc,Mutex};
 
-
-
-fn archive_builder() -> Option<Builder<GzEncoder<File>>> {
-    let tar_gz = match File::create("test.tar.gz"){
+async fn archive_builder() -> Option<Builder<GzipEncoder<File>>> {
+    let tar_gz = match File::create("test.tar.gz").await{
         Ok(archive) => archive,
         Err(_)=> return None
     };
-    let enc = GzEncoder::new(tar_gz, Compression::default());
-    let mut tar: Builder<GzEncoder<File>> = Builder::new(enc);
+    let enc = GzipEncoder::new(tar_gz);
+    let mut tar: Builder<GzipEncoder<File>> = Builder::new(enc);
     //tar.append_dir_all("test", "test")?;
     //tar.finish()?;
     Some(tar)
@@ -49,37 +49,49 @@ fn connect_webdav() -> Operator {
     op
 }
 
+
+
 async fn download_files (op: Operator, path: &str)-> () {
     
-    let mut entries_lister = op.lister_with(path)
+    let entries_lister: opendal::Lister = op.lister_with(path)
         .recursive(true).await.unwrap(); 
+    let op_arc = Arc::new(op);
+    let entries_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let entries_tasks_arc = Arc::new(Mutex::new(entries_tasks));
+    entries_lister.for_each_concurrent(None, |entry_res| async {
+    let opclone = Arc::clone(&op_arc);
+        if let Ok(entry) = entry_res {
 
-    while let Some(entry) = entries_lister.next().await {
-        let mut reader = match entry {
-            Ok(entry) => {
-                println!("Entry: {:?}", entry);
-                let reader = match op.reader(path).await {
-                    Ok(r) => r,
-                    Err(e) => {println!("Error: {}", e); continue;},
-                };
-                reader
-            },
-            Err(e) => {println!("Error: {}", e); continue;},
-        };
-        let mut buffer: [u8; 1024] = [0 ; 1024]; // 1kb buffer, it may change nothing if more was attributed
+            let entry_task = task::spawn( async move{
+                let reader = (*opclone).reader(entry.path()).await.unwrap();
+            });
+            let mut entries_tasks_mutex = entries_tasks_arc.lock().unwrap();
+            (*entries_tasks_mutex).push(entry_task);
+            
+        }
+    }).await;
+    let mut entries_tasks_mutex = entries_tasks_arc.lock().unwrap();
+    let entries_tasks: std::vec::Drain<JoinHandle<_>> = entries_tasks_mutex.drain(..);
+    join_all(entries_tasks).await;
+    //     tokio::join!(task);
+    // }
+    // while let Some(entry_res) = entries_lister.next().await {
         
-        let mut tmpFile = File::create("tmpFile").unwrap();
+    //     // let entry_task = task::spawn(async move{
+    //     //     if let Ok(entry) = entry_res {
+    //     //         let mut reader = (opclone).reader(entry.path()).await.unwrap();
+    //     //     }
+    //     // });
 
-        while reader.read(&mut buffer).await.unwrap() != 0{
-            //write buffer into archive
-        };
-        
-    }
+    //     // entries_tasks.push(entry_task);
+    // }
+    // join_all(entries_tasks).await;
     ()
 }
 
 #[tokio::main]
 async fn main() {
-    let mut op = connect_webdav();
+    let op = connect_webdav();
+   // let mut tar = archive_builder().unwrap();
     println!("Hello, world!");
 }
