@@ -1,29 +1,27 @@
-use async_compression::futures::write::GzipEncoder;
-use futures::Stream;
+use async_compression::tokio::write::GzipEncoder;
 use opendal::services::Webdav;
 use opendal::{Operator, Entry};
 use opendal::raw::HttpClient;
 use reqwest;
-use async_tar::Builder;
-use async_fs::File;
+use tokio_tar::Builder;
 use futures::stream::StreamExt;
 use tokio;
 use tokio::task;
 use tokio::task::JoinHandle;
-use futures::future::{join_all, Join};
+use tokio::fs::File;
 use rayon::prelude::*;
 use std::sync::{Arc,Mutex};
 
-async fn archive_builder() -> Option<Builder<GzipEncoder<File>>> {
-    let tar_gz = match File::create("test.tar.gz").await{
-        Ok(archive) => archive,
-        Err(_)=> return None
-    };
-    let enc = GzipEncoder::new(tar_gz);
-    let mut tar: Builder<GzipEncoder<File>> = Builder::new(enc);
-    //tar.append_dir_all("test", "test")?;
-    //tar.finish()?;
-    Some(tar)
+async fn archive_builder() -> Result<Builder<GzipEncoder<File>>, std::io::Error>{
+    match File::create("test.tar.gz").await{
+        Ok(archive) => {
+            let tar_gz = archive;
+            let enc = GzipEncoder::new(tar_gz);
+            let mut tar: Builder<GzipEncoder<File>> = Builder::new(enc);
+            Ok(tar)
+        },
+        Err(_)=> {Err(std::io::Error::new(std::io::ErrorKind::Interrupted,"Error creating archive"))}
+    }
 }
 
 // async fn connect_webdav() -> std::io::Result<Vec<opendal::Entry>> {
@@ -51,22 +49,26 @@ fn connect_webdav() -> Operator {
 
 
 
-async fn download_files (op: Operator, path: &str)-> () {
+async fn download_files_to_archive (op: Operator, path: &str, archive : &mut Builder<GzipEncoder<File>> )-> () {
     
     let entries_lister: opendal::Lister = op.lister_with(path)
         .recursive(true).await.unwrap(); 
     let op_arc = Arc::new(op);
     let entries_tasks: Vec<JoinHandle<()>> = Vec::new();
     let entries_tasks_arc = Arc::new(Mutex::new(entries_tasks));
+    let archive_mutex = Arc::new(Mutex::new(archive));
+    
     entries_lister.for_each_concurrent(None, |entry_res| async {
-    let opclone = Arc::clone(&op_arc);
         if let Ok(entry) = entry_res {
-
+            let opclone = Arc::clone(&op_arc);
             let entry_task = task::spawn( async move{
                 let reader = (*opclone).reader(entry.path()).await.unwrap();
+                let mut archive_guard = archive_mutex.lock().unwrap();
+                (*archive_guard).append_file(entry.path(), reader).await.unwrap();
+
             });
-            let mut entries_tasks_mutex = entries_tasks_arc.lock().unwrap();
-            (*entries_tasks_mutex).push(entry_task);
+            let mut entries_tasks_guard = entries_tasks_arc.lock().unwrap();
+            (*entries_tasks_guard).push(entry_task);
             
         }
     }).await;
